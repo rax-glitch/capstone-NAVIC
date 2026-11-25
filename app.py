@@ -7,7 +7,7 @@ Design rules
   * sTEC is NOT clipped, abs()'d or forced to a fixed median.
 
 Install:  pip install streamlit pandas numpy plotly numba
-Run:      streamlit run navic_workbench.py
+Run:      streamlit run app.py
 """
 import io
 import os
@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 try:
     from numba import njit
     HAS_NUMBA = True
@@ -332,10 +333,27 @@ def compute_physics(_l5, _s, data_key, cfg):
         notes.append("No elevation column for this channel: elevation mask NOT applied, VTEC and sky plot unavailable.")
 
     t = df["t"].values
-    dt = np.diff(t, prepend=np.nan)
-    prev_valid = np.r_[False, valid[:-1]]
-    start = valid & ((~prev_valid) | (dt > cfg["gap_s"]) | np.isnan(dt))
-    arc = np.where(valid, np.cumsum(start), -1).astype(np.int64)
+    # -- plausibility gates: sentinel/zero pseudoranges and physically impossible TEC --
+    pr5, prs = df["PR_L5"].values, df["PR_S"].values
+    n_before = int(valid.sum())
+    valid &= (pr5 > 0) & (prs > 0)
+    raw0 = (pr5 - prs) / M_PER_TECU
+    if valid.any():
+        med0 = float(np.nanmedian(raw0[valid]))
+        valid &= np.abs(raw0 - med0) <= cfg["max_dev"]
+
+    def build_arcs(valid):
+        dt = np.diff(t, prepend=np.nan)
+        prev_valid = np.r_[False, valid[:-1]]
+        start = valid & ((~prev_valid) | (dt > cfg["gap_s"]) | np.isnan(dt))
+        return np.where(valid, np.cumsum(start), -1).astype(np.int64)
+
+    arc = build_arcs(valid)
+    for a_, b_ in segments(arc):                       # drop arcs that are too short to trust
+        if t[b_ - 1] - t[a_] < cfg["min_arc_s"]:
+            valid[a_:b_] = False
+    arc = build_arcs(valid)
+    n_rejected = n_before - int(valid.sum())
     df["arc"], df["valid"] = arc, valid
     segs = segments(arc)
     if not segs:
@@ -427,7 +445,7 @@ def compute_physics(_l5, _s, data_key, cfg):
         "notes": notes, "n_total": len(df), "n_valid": int(valid.sum()), "n_arcs": len(segs),
         "dt_med": dt_med, "n_hampel": n_hamp, "t0": float(df["t"].iloc[0]),
         "stec_median": float(np.nanmedian(tec)), "frac_neg": float(np.nanmean(tec < 0)),
-        "dop_channels": n_geo,
+        "dop_channels": n_geo, "n_rejected": n_rejected,
     }
     return df, info
 
@@ -489,8 +507,10 @@ def make_plot_df(d, dt_med, gap_s, max_pts=60000):
         pos = np.arange(n); bucket = pos // k
         keep = set(pos[::k].tolist())
         for c, fn in (("Model_Score", "idxmax"), ("ROTI", "idxmax"), ("sTEC", "idxmax"), ("sTEC", "idxmin")):
-            g = getattr(pd.Series(d[c].values).groupby(bucket), fn)()
-            keep.update(g.dropna().astype(int).tolist())
+            v = d[c].values.astype(float)
+            v = np.where(np.isnan(v), -np.inf if fn == "idxmax" else np.inf, v)   # all-NaN bucket safe
+            g = getattr(pd.Series(v).groupby(bucket), fn)()
+            keep.update(g.astype(int).tolist())
         d = d.iloc[sorted(keep)]
     gap = max(gap_s, 3.0 * k * dt_med)
     gi = np.flatnonzero(np.diff(d["t"].values) > gap)
@@ -616,6 +636,10 @@ with st.sidebar:
     gap_s = st.number_input("Max gap inside an arc (s)", 1.0, 600.0, 10.0, 1.0)
     smooth_s = st.number_input("Code-noise smoothing (s, 0 = off)", 0.0, 120.0, 15.0, 5.0,
                                help="Rolling median. Code TEC is noisy (~0.2 m per TECU); smoothing trades speed for noise.")
+    max_dev = st.number_input("Reject |sTEC − median| larger than (TECU)", 20.0, 2000.0, 200.0, 10.0,
+                              help="Removes sentinel values / clock-offset garbage. Real TEC rarely moves >200 TECU from its median.")
+    min_arc_s = st.number_input("Min arc length (s)", 0.0, 3600.0, 120.0, 30.0,
+                                help="Arcs shorter than this are dropped (too short for despiking/ROTI).")
     hampel_k = st.number_input("Outlier/cycle-slip despike k·MAD (0 = off)", 0.0, 10.0, 5.0, 0.5)
 
     st.divider()
@@ -629,7 +653,7 @@ with st.sidebar:
 
 cfg = {"ch": int(ch), "maps": maps, "h_ion": float(h_ion), "cal_mode": cal_mode, "dcb": float(dcb),
        "ref_tec": float(ref_tec), "el_cut": float(el_cut), "gap_s": float(gap_s), "smooth_s": float(smooth_s),
-       "hampel_k": float(hampel_k), "tscale": tscale, "min_lock": float(min_lock),
+       "hampel_k": float(hampel_k), "max_dev": float(max_dev), "min_arc_s": float(min_arc_s), "tscale": tscale, "min_lock": float(min_lock),
        "ref_pos": parse_ref(ref_txt), "channels": tuple(channels)}
 
 df, info = compute_physics(df_l5, df_s, data_key, cfg)
@@ -651,7 +675,7 @@ with st.expander("📋 Data-quality report & assumptions", expanded=False):
     q2.metric("Valid epochs", f"{info['n_valid']:,}")
     q3.metric("Continuous arcs", info["n_arcs"])
     q4.metric("Sample interval", f"{info['dt_med']:.2f} s")
-    st.write(f"Despiked outliers: **{info['n_hampel']:,}** • median sTEC: **{info['stec_median']:.1f} TECU** • "
+    st.write(f"Rejected by plausibility/short-arc gates: **{info['n_rejected']:,}** epochs • Despiked outliers: **{info['n_hampel']:,}** • median sTEC: **{info['stec_median']:.1f} TECU** • "
              f"negative sTEC: **{100 * info['frac_neg']:.1f}%** (large share ⇒ DCB offset not removed)")
     for n_ in info["notes"]:
         st.warning(n_)
